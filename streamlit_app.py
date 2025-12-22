@@ -11,6 +11,9 @@ from skopt import gp_minimize
 from skopt.space import Integer
 # ---------------------
 
+# Set page config at the very top to avoid errors
+st.set_page_config(layout="wide", page_title="Power System Optimization")
+
 # ----------------------------------------------------------------------
 # 1. HELPER FUNCTIONS (MAX BOUNDS, PLOTTING, DATA LOADING)
 # ----------------------------------------------------------------------
@@ -24,7 +27,7 @@ def load_data(demand_file, solar_file, wind_file):
         # Read demand
         demand_df = pd.read_csv(demand_file)
         # Note: Assumes the demand file has an 'Mwh' column
-        demand_kwh = demand_df['Mwh'].astype(float) * 1000 # Convert MWh to kWh
+        demand_kwh = demand_df['Mwh'].astype(float) * 1000  # Convert MWh to kWh
 
         # Read solar (skip headers from Renewables.ninja)
         solar_df = pd.read_csv(solar_file, skiprows=3)
@@ -54,12 +57,23 @@ def calculate_max_bounds(params):
     """
     Calculates the maximum number of units possible within the budget.
     """
-    Nmax_mill = params['BUDGET'] // params['COST_WIND_UNIT']
-    Nmax_panel = params['BUDGET'] // params['COST_SOLAR_UNIT']
-    Nmax_SMR = params['BUDGET'] // params['COST_NUCLEAR_UNIT']
-    # Storage max is not needed as it uses the remainder of the budget
+    # Protect against division by zero if costs are 0 (unlikely but safe)
+    if params['COST_WIND_UNIT'] > 0:
+        Nmax_mill = params['BUDGET'] // params['COST_WIND_UNIT']
+    else:
+        Nmax_mill = 0
+        
+    if params['COST_SOLAR_UNIT'] > 0:
+        Nmax_panel = params['BUDGET'] // params['COST_SOLAR_UNIT']
+    else:
+        Nmax_panel = 0
+        
+    if params['COST_NUCLEAR_UNIT'] > 0:
+        Nmax_SMR = params['BUDGET'] // params['COST_NUCLEAR_UNIT']
+    else:
+        Nmax_SMR = 0
     
-    # Set a practical upper limit for solar panels to prevent overflow/unrealistically large numbers
+    # Set a practical upper limit for solar panels to prevent overflow
     Nmax_panel = min(Nmax_panel, 100_000_000) 
 
     return int(Nmax_mill), int(Nmax_panel), int(Nmax_SMR)
@@ -89,16 +103,17 @@ def gas_production_skopt(N_input, data_frame, params):
     if cost > params['BUDGET']:
         return 1e18  # Massive penalty for budget overrun
     
-    # Remaining budget determines storage capacity (based on user's logic)
+    # Remaining budget determines storage capacity
     remaining_budget = params['BUDGET'] - cost
-    
-    # Note: CostStorage is in €/kWh, so remaining_budget/CostStorage is kWh
     capacity_storage_kwh = remaining_budget / params['COST_STORAGE_KWH'] 
     
     # ----------- Start Hourly Simulation -----------
     
     P_hydro = params['HYDRO_CAPACITY_KW'] 
-    P_storage_max_dispatch = capacity_storage_kwh / params['STORAGE_DISPATCH_HOURS']
+    if params['STORAGE_DISPATCH_HOURS'] > 0:
+        P_storage_max_dispatch = capacity_storage_kwh / params['STORAGE_DISPATCH_HOURS']
+    else:
+        P_storage_max_dispatch = 0
     
     # Time Series Generation
     Gen_Baseload_kWh = P_nuc + P_hydro
@@ -108,6 +123,7 @@ def gas_production_skopt(N_input, data_frame, params):
     Demand_kWh_ts = data_frame['Demand_kWh']
     
     SOC = np.zeros(len(data_frame))
+    # Initial SOC
     SOC[0] = capacity_storage_kwh * params['STORAGE_INITIAL_SOC']
     
     Gas_Generation_kWh = np.zeros(len(data_frame))
@@ -118,20 +134,15 @@ def gas_production_skopt(N_input, data_frame, params):
         Gen_Total_t = Gen_Baseload_kWh + Gen_Solar_kWh.iloc[t] + Gen_Wind_kWh.iloc[t]
         Balance_t = Gen_Total_t - Demand_t
         
-        if Balance_t >= 0: # Surplus: Store or Curtail
+        if Balance_t >= 0: # Surplus: Store
             Surplus_t = Balance_t
             Max_Charge_t = capacity_storage_kwh - current_soc
             
-            # The user's script applies efficiency upon discharge, let's keep it simple here
-            # and use the charging efficiency logic from my previous script, as it's common.
-            # Storable_Energy_t = Surplus_t * params['STORAGE_EFFICIENCY']
-            
-            # Storable energy based on surplus power (max C/T rate)
             Storable_Energy_t = min(Surplus_t, P_storage_max_dispatch) 
-            
             Energy_Charged_t = min(Storable_Energy_t, Max_Charge_t)
             
-            current_soc += Energy_Charged_t * params['STORAGE_EFFICIENCY'] # Apply efficiency on charging
+            # Apply efficiency on charging
+            current_soc += Energy_Charged_t * params['STORAGE_EFFICIENCY'] 
             Gas_Generation_kWh[t] = 0
             
         else: # Deficit: Discharge Storage, then use Gas
@@ -140,8 +151,6 @@ def gas_production_skopt(N_input, data_frame, params):
             
             Energy_Discharged_t = min(Max_Discharge_t, Deficit_t)
             
-            # Note: We discharge the energy available (current_soc) and assume perfect discharge efficiency
-            # as the round-trip efficiency was applied during charging.
             current_soc -= Energy_Discharged_t
             
             Remaining_Deficit = Deficit_t - Energy_Discharged_t
@@ -150,9 +159,27 @@ def gas_production_skopt(N_input, data_frame, params):
         # Ensure SOC stays within bounds
         current_soc = np.clip(current_soc, 0, capacity_storage_kwh)
         SOC[t] = current_soc
-        
+    
     total_gas = np.sum(Gas_Generation_kWh)
     
+    # --- PENALTY LOGIC: RESTORE SOC TO INITIAL LEVEL ---
+    # If the simulation ends with less energy than it started, we simulate 
+    # running the gas plant to refill it back to the target level.
+    
+    target_soc = capacity_storage_kwh * params['STORAGE_INITIAL_SOC']
+    final_soc = SOC[-1]
+    
+    if final_soc < target_soc:
+        missing_energy_kwh = target_soc - final_soc
+        # To store 'missing_energy' in the battery, we need to generate more than that due to efficiency losses
+        # Energy_In * Efficiency = Energy_Stored  =>  Energy_In = Energy_Stored / Efficiency
+        if params['STORAGE_EFFICIENCY'] > 0:
+            gas_needed_to_refill = missing_energy_kwh / params['STORAGE_EFFICIENCY']
+        else:
+            gas_needed_to_refill = missing_energy_kwh # Should not happen with valid inputs, fallback
+            
+        total_gas += gas_needed_to_refill
+
     # Skopt only needs the objective function value
     return total_gas
 
@@ -180,7 +207,7 @@ def gas_minimization(_data_df, params):
     def objective_function(N_input):
         return gas_production_skopt(N_input, _data_df, params)
 
-    # Define initial starting points (similar to user's code, but adjusted for scale)
+    # Define initial starting points
     initial_x0 = [
         min(10, Nmax_mill), 
         min(1000000, Nmax_panel), 
@@ -233,11 +260,9 @@ def gas_minimization(_data_df, params):
     return best_config, best_results
 
 # ----------------------------------------------------------------------
-# 4. FULL SIMULATION FUNCTION (For extracting results/plotting after optimization)
+# 4. FULL SIMULATION FUNCTION (For extracting results/plotting)
 # ----------------------------------------------------------------------
 
-# NOTE: This function is nearly identical to gas_production_skopt but returns
-# the full set of simulation results and time series.
 def run_simulation_full_results(N_mill, N_panel, N_SMR, data_frame, params):
     
     # Calculate Capacities (kW) and Costs
@@ -256,7 +281,10 @@ def run_simulation_full_results(N_mill, N_panel, N_SMR, data_frame, params):
     
     # ----------- Start Hourly Simulation -----------
     P_hydro = params['HYDRO_CAPACITY_KW'] 
-    P_storage_max_dispatch = capacity_storage_kwh / params['STORAGE_DISPATCH_HOURS']
+    if params['STORAGE_DISPATCH_HOURS'] > 0:
+        P_storage_max_dispatch = capacity_storage_kwh / params['STORAGE_DISPATCH_HOURS']
+    else:
+        P_storage_max_dispatch = 0
     
     Gen_Baseload_kWh = P_nuc + P_hydro
     Gen_Solar_kWh = data_frame['Solar_kW_per_kWp'] * Capacity_Solar_kWp
@@ -277,7 +305,7 @@ def run_simulation_full_results(N_mill, N_panel, N_SMR, data_frame, params):
         Gen_Total_t = Gen_Baseload_kWh + Gen_Solar_kWh.iloc[t] + Gen_Wind_kWh.iloc[t]
         Balance_t = Gen_Total_t - Demand_t
         
-        if Balance_t >= 0: # Surplus: Store or Curtail
+        if Balance_t >= 0: # Surplus
             Surplus_t = Balance_t
             Max_Charge_t = capacity_storage_kwh - current_soc
             
@@ -288,7 +316,7 @@ def run_simulation_full_results(N_mill, N_panel, N_SMR, data_frame, params):
             Curtailed_Energy_kWh[t] = Surplus_t - Energy_Charged_t
             Gas_Generation_kWh[t] = 0
             
-        else: # Deficit: Discharge Storage, then use Gas
+        else: # Deficit
             Deficit_t = abs(Balance_t)
             Max_Discharge_t = min(P_storage_max_dispatch, current_soc)
             
@@ -302,19 +330,34 @@ def run_simulation_full_results(N_mill, N_panel, N_SMR, data_frame, params):
             
         current_soc = np.clip(current_soc, 0, capacity_storage_kwh)
         SOC[t] = current_soc
+    
+    # --- PENALTY LOGIC: RESTORE SOC TO INITIAL LEVEL ---
+    target_soc = capacity_storage_kwh * params['STORAGE_INITIAL_SOC']
+    final_soc = SOC[-1]
+    
+    if final_soc < target_soc:
+        missing_energy_kwh = target_soc - final_soc
+        if params['STORAGE_EFFICIENCY'] > 0:
+            gas_needed_to_refill = missing_energy_kwh / params['STORAGE_EFFICIENCY']
+        else:
+            gas_needed_to_refill = missing_energy_kwh
+            
+        # Add the cost to the last hour of gas generation so it appears in plots/totals
+        Gas_Generation_kWh[-1] += gas_needed_to_refill
         
+        # Visually update the SOC for the last hour to show it returned to target
+        SOC[-1] = target_soc
+
     total_gas = np.sum(Gas_Generation_kWh)
     total_curtailed = np.sum(Curtailed_Energy_kWh)
     
     return total_gas, total_curtailed, cost, SOC, Gas_Generation_kWh
 
 # ----------------------------------------------------------------------
-# 5. STREAMLIT APP LAYOUT (Modified to handle unit costs/powers)
+# 5. STREAMLIT APP LAYOUT
 # ----------------------------------------------------------------------
 
-# ... (Plotting helper functions remain the same) ...
 def plot_pie_chart(data, title):
-    # ... (same as before) ...
     labels = data.keys()
     sizes = data.values()
     
@@ -327,75 +370,41 @@ def plot_pie_chart(data, title):
 def get_hourly_timeseries(config, _data_df, params, best_results):
     """
     Re-creates the full hourly timeseries for the optimal mix for plotting.
-    Uses the results of the full simulation run.
     """
-    Capacity_Wind_kW = config['N_wind_units'] * params['WIND_RATED_POWER_KW']
-    Capacity_Solar_kWp = config['N_solar_units'] * params['SOLAR_RATED_POWER_KWp']
-    P_nuc = config['N_nuclear'] * params['SMR_RATED_POWER_KW']
-    capacity_storage_kwh = config['Storage_Capacity_kWh']
-    
-    P_storage_max_dispatch = capacity_storage_kwh / params['STORAGE_DISPATCH_HOURS']
-    
     SOC = best_results['SOC']
-    
-    Gen_Hydro_kWh = pd.Series(np.repeat(params['HYDRO_CAPACITY_KW'], len(_data_df)))
-    Gen_Nuclear_kWh = pd.Series(np.repeat(P_nuc, len(_data_df)))
-    Gen_Solar_kWh = _data_df['Solar_kW_per_kWp'] * Capacity_Solar_kWp
-    Gen_Wind_kWh = _data_df['Wind_kW_per_kW'] * Capacity_Wind_kW
-    Demand_kWh_ts = _data_df['Demand_kWh']
-    
-    # Calculate flows based on SOC change (simplified for plotting)
-    # The discharge/charge flows are complex to calculate *perfectly* from SOC alone due to efficiency.
-    # We will approximate based on the full simulation run's logic to maintain consistency.
-    
-    Storage_Charge_kWh = np.zeros(len(_data_df))
-    Storage_Discharge_kWh = np.zeros(len(_data_df))
-    
-    current_soc = SOC[0]
-    
-    for t in range(len(_data_df)):
-        Demand_t = Demand_kWh_ts.iloc[t]
-        Gen_Total_t = Gen_Hydro_kWh.iloc[t] + Gen_Nuclear_kWh.iloc[t] + Gen_Solar_kWh.iloc[t] + Gen_Wind_kWh.iloc[t]
-        Balance_t = Gen_Total_t - Demand_t
-        
-        if Balance_t >= 0: 
-            Surplus_t = Balance_t
-            Max_Charge_t = capacity_storage_kwh - current_soc
-            Storable_Energy_t = min(Surplus_t, P_storage_max_dispatch) 
-            Energy_Charged_t = min(Storable_Energy_t, Max_Charge_t)
-            
-            # This is the energy that *actually* goes into the battery (after efficiency)
-            Storage_Charge_kWh[t] = Energy_Charged_t * params['STORAGE_EFFICIENCY']
-            current_soc += Storage_Charge_kWh[t]
-            
-        else: 
-            Deficit_t = abs(Balance_t)
-            Max_Discharge_t = min(P_storage_max_dispatch, current_soc)
-            Energy_Discharged_t = min(Max_Discharge_t, Deficit_t)
-            
-            # This is the useful energy coming *out* of the battery
-            Storage_Discharge_kWh[t] = Energy_Discharged_t
-            current_soc -= Energy_Discharged_t
-            
-        current_soc = np.clip(current_soc, 0, capacity_storage_kwh)
+    Gas_Series = best_results['Gas_Generation_kWh_TS']
     
     hourly_df = pd.DataFrame({
-        'Demand': Demand_kWh_ts,
-        'Hydro': Gen_Hydro_kWh,
-        'Nuclear': Gen_Nuclear_kWh,
-        'Solar': Gen_Solar_kWh,
-        'Wind': Gen_Wind_kWh,
-        'Gas': best_results['Gas_Generation_kWh_TS'], # Use the exact Gas production from the optimization run
-        'Storage_Discharge': Storage_Discharge_kWh,
-        'Storage_Charge': Storage_Charge_kWh,
-        'Curtailed': best_results['Total_Curtailed_kWh'] * np.ones(len(_data_df)) / len(_data_df), # Crude representation
-        'SOC': best_results['SOC']
+        'Demand': _data_df['Demand_kWh'],
+        'Hydro': params['HYDRO_CAPACITY_KW'],
+        'Nuclear': config['N_nuclear'] * params['SMR_RATED_POWER_KW'],
+        'Solar': _data_df['Solar_kW_per_kWp'] * (config['N_solar_units'] * params['SOLAR_RATED_POWER_KWp']),
+        'Wind': _data_df['Wind_kW_per_kW'] * (config['N_wind_units'] * params['WIND_RATED_POWER_KW']),
+        'Gas': Gas_Series,
+        'SOC': SOC,
+        # We simplify discharge/charge visualization for the chart
+        # 'Storage_Flow': This is complex to derive perfectly without running the loop, 
+        # so we will rely on the "Balance" for the chart if needed, or just show sources.
+        # But for stacked area, we need the discharge component.
     })
     
+    # Approximate Storage Discharge for plotting purposes based on Deficit/Surplus logic
+    # (Note: This is visual only, the 'Gas' column is exact from the simulation)
+    # We can infer Storage Discharge where Gen < Demand but Gas wasn't used fully.
+    
+    total_gen_renew = hourly_df['Hydro'] + hourly_df['Nuclear'] + hourly_df['Solar'] + hourly_df['Wind']
+    balance = total_gen_renew - hourly_df['Demand']
+    
+    # Where balance is negative, we used storage or gas.
+    # Storage_Discharge = Deficit - Gas_Used
+    deficit = balance.apply(lambda x: abs(x) if x < 0 else 0)
+    hourly_df['Storage_Discharge'] = deficit - hourly_df['Gas']
+    # Clean up any tiny floating point errors
+    hourly_df['Storage_Discharge'] = hourly_df['Storage_Discharge'].apply(lambda x: max(0, x))
+
     return hourly_df
 
 
-st.set_page_config(layout="wide")
 st.title("⚡ Power System Optimization Tool (Bayesian)")
 
 # --- SIDEBAR ---
@@ -409,18 +418,18 @@ wind_file = st.sidebar.file_uploader("Upload Wind CSV (Renewables.ninja)", type=
 
 params = {}
 
-# Technology Parameters (using unit costs and rated powers from your data)
+# Technology Parameters
 st.sidebar.subheader("2. Technology Parameters")
 
 # Nuclear
 params['SMR_RATED_POWER_KW'] = st.sidebar.number_input("SMR Rated Power (kW/unit)", value=50_000, format="%d", key='P_NUC')
 params['COST_NUCLEAR_UNIT'] = st.sidebar.number_input("Nuclear Unit Cost (€)", value=250_000_000, format="%d", key='C_NUC')
 
-# Wind (Mill)
+# Wind
 params['WIND_RATED_POWER_KW'] = st.sidebar.number_input("Wind Rated Power (kW/unit)", value=5000, format="%d", key='P_WIND')
 params['COST_WIND_UNIT'] = st.sidebar.number_input("Wind Mill Unit Cost (€)", value=6_500_000, format="%d", key='C_WIND')
 
-# Solar (Panel)
+# Solar
 params['SOLAR_RATED_POWER_KWp'] = st.sidebar.number_input("Solar Rated Power (kWp/unit)", value=0.55, key='P_SOLAR')
 params['COST_SOLAR_UNIT'] = st.sidebar.number_input("Solar Panel Unit Cost (€)", value=600.0, key='C_SOLAR')
 
@@ -430,15 +439,15 @@ params['STORAGE_DISPATCH_HOURS'] = st.sidebar.number_input("Storage Dispatch Tim
 params['STORAGE_EFFICIENCY'] = st.sidebar.slider("Storage Efficiency (Roundtrip)", 0.0, 1.0, 0.85, key='ETA_STORAGE')
 params['STORAGE_INITIAL_SOC'] = st.sidebar.slider("Storage Initial SOC (%)", 0.0, 1.0, 0.5, key='SOC_INIT')
 
-# Hydro (Baseload)
+# Hydro
 params['HYDRO_CAPACITY_KW'] = st.sidebar.number_input("Hydro Capacity (kW)", value=258_996, format="%d", key='P_HYDRO')
 
 st.sidebar.subheader("3. Financial Parameters")
 params['BUDGET'] = st.sidebar.number_input("Total Investment Budget (€)", value=8_920_200_000, format="%d", key='BUDGET')
 
 st.sidebar.subheader("4. Optimization Settings (skopt)")
-params['SKOPT_N_CALLS'] = st.sidebar.number_input("Total Optimizer Iterations", value=150, min_value=10, max_value=500)
-params['SKOPT_N_RANDOM_STARTS'] = st.sidebar.number_input("Random Initialization Points", value=100, min_value=10, max_value=400)
+params['SKOPT_N_CALLS'] = st.sidebar.number_input("Total Optimizer Iterations", value=50, min_value=10, max_value=500)
+params['SKOPT_N_RANDOM_STARTS'] = st.sidebar.number_input("Random Initialization Points", value=15, min_value=5, max_value=100)
 
 
 # --- MAIN PANEL ---
@@ -491,11 +500,14 @@ else:
                 total_demand = hourly_data['Demand'].sum()
                 total_curtailed = best_results['Total_Curtailed_kWh']
                 total_potential_gen = annual_gen_kwh['Hydro'] + annual_gen_kwh['Nuclear'] + annual_gen_kwh['Solar'] + annual_gen_kwh['Wind']
-                spared_percent = (total_curtailed / total_potential_gen) * 100
+                if total_potential_gen > 0:
+                    spared_percent = (total_curtailed / total_potential_gen) * 100
+                else:
+                    spared_percent = 0
                 
                 peak_gas_power_kw = hourly_data['Gas'].max()
                 
-                # CO2 Emissions (Using 490 gCO2/kWh for Gas from your data)
+                # CO2 Emissions
                 co2_emissions_g_kwh = {'Nuclear': 12, 'Hydro': 24, 'Solar': 48, 'Wind': 11, 'Gas (Required)': 490}
                 total_co2_g = sum(annual_gen_kwh[source] * co2_emissions_g_kwh.get(source, 0) for source in annual_gen_kwh)
                 avg_emissions_intensity = total_co2_g / total_demand
@@ -534,7 +546,7 @@ else:
                     st.pyplot(fig)
                 
                 with col2:
-                    st.dataframe(pd.DataFrame.from_dict(annual_gen_kwh, orient='index', columns=['Total MWh']).apply(lambda x: x/1e6))
+                    st.dataframe(pd.DataFrame.from_dict(annual_gen_kwh, orient='index', columns=['Total kWh']).apply(lambda x: x/1e6).rename(columns={'Total kWh': 'Total MWh'}))
 
                 # 4. Hourly Plots
                 st.subheader("Hourly System Dynamics (Full Year)")
@@ -570,7 +582,8 @@ else:
                 )
                 
                 final_chart = (gen_chart + demand_chart).properties(
-                    title="Hourly Demand vs. Generation"
+                    title="Hourly Demand vs. Generation",
+                    height=400
                 ).interactive()
                 
                 st.altair_chart(final_chart, use_container_width=True)
