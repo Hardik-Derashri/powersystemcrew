@@ -17,7 +17,6 @@ st.set_page_config(layout="wide", page_title="Power System Optimization")
 # ----------------------------------------------------------------------
 # 1. HELPER FUNCTIONS (MAX BOUNDS, PLOTTING, DATA LOADING)
 # ----------------------------------------------------------------------
-
 @st.cache_data
 def load_data(demand_file, solar_file, wind_file):
     """
@@ -26,29 +25,27 @@ def load_data(demand_file, solar_file, wind_file):
     try:
         # Read demand
         demand_df = pd.read_csv(demand_file)
-        # Note: Assumes the demand file has an 'Mwh' column
         demand_kwh = demand_df['Mwh'].astype(float) * 1000  # Convert MWh to kWh
 
-      
-        # Note: Assumes 'electricity [kWh]' column for per kWp output
+        # Read solar (No skiprows needed for your file)
+        solar_df = pd.read_csv(solar_file)
         solar_kw_per_kwp = solar_df['electricity [kWh]'].astype(float)
 
-    
-        # Note: Assumes 'electricity [kWh]' column for per kW output
+        # Read wind (No skiprows needed for your file)
+        wind_df = pd.read_csv(wind_file)
         wind_kw_per_kw = wind_df['electricity [kWh]'].astype(float)
 
         # Combine
         max_len = min(len(demand_kwh), len(solar_kw_per_kwp), len(wind_kw_per_kw))
         data_df = pd.DataFrame({
-            'Demand_kWh': demand_kwh.head(max_len),
-            'Solar_kW_per_kWp': solar_kw_per_kwp.head(max_len),
-            'Wind_kW_per_kW': wind_kw_per_kw.head(max_len)
+            'Demand_kWh': demand_kwh.head(max_len).values,
+            'Solar_kW_per_kWp': solar_kw_per_kwp.head(max_len).values,
+            'Wind_kW_per_kW': wind_kw_per_kw.head(max_len).values
         })
         return data_df
     
     except Exception as e:
         st.error(f"Error loading files: {e}")
-        st.error("Please ensure files are correct CSVs and match the expected format.")
         return None
 
 def calculate_max_bounds(params):
