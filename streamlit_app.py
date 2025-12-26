@@ -29,13 +29,11 @@ def load_data(demand_file, solar_file, wind_file):
         # Note: Assumes the demand file has an 'Mwh' column
         demand_kwh = demand_df['Mwh'].astype(float) * 1000  # Convert MWh to kWh
 
-        # Read solar (skip headers from Renewables.ninja)
-        solar_df = pd.read_csv(solar_file, skiprows=3)
+      
         # Note: Assumes 'electricity [kWh]' column for per kWp output
         solar_kw_per_kwp = solar_df['electricity [kWh]'].astype(float)
 
-        # Read wind (skip headers from Renewables.ninja)
-        wind_df = pd.read_csv(wind_file, skiprows=3)
+    
         # Note: Assumes 'electricity [kWh]' column for per kW output
         wind_kw_per_kw = wind_df['electricity [kWh]'].astype(float)
 
@@ -71,10 +69,7 @@ def calculate_max_bounds(params):
     if params['COST_NUCLEAR_UNIT'] > 0:
         Nmax_SMR = params['BUDGET'] // params['COST_NUCLEAR_UNIT']
     else:
-        Nmax_SMR = 0
-    
-    # Set a practical upper limit for solar panels to prevent overflow
-    Nmax_panel = min(Nmax_panel, 100_000_000) 
+        Nmax_SMR = 0 
 
     return int(Nmax_mill), int(Nmax_panel), int(Nmax_SMR)
 
